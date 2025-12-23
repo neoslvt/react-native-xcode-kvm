@@ -369,4 +369,4 @@ For issues related to:
 - **Mutagen**: See [Mutagen documentation](https://mutagen.io/documentation)
 - **These scripts**: Check troubleshooting section above
 
----
+**Project supported by** [FST](https://fst.kz)
