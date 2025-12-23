@@ -1,0 +1,326 @@
+#!/bin/bash
+# xcode command: Manage React Native project sync with macOS VM
+# Usage:
+#   xcode add              - Setup mutagen sync and generate run_react_native.sh
+#   xcode remove           - Remove mutagen sync and delete run_react_native.sh
+#   xcode run [args...]    - SSH to macOS VM and run run_react_native.sh with optional arguments
+
+set -e
+
+# Colors
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+NC='\033[0m' # No Color
+
+# Default values
+MACOS_USER="macos"
+MACOS_PORT=2222
+SYNC_SCRIPT="run_react_native.sh"
+
+# Function to get app name from app.json or package.json
+get_app_name() {
+    local app_name=""
+    
+    # Try app.json first
+    if [[ -f "app.json" ]]; then
+        app_name=$(grep -m 1 -o '"name": *"[^"]*"' app.json 2>/dev/null | cut -d '"' -f 4 | tr -d ' ' || echo "")
+    fi
+    
+    # Fall back to package.json if app.json doesn't have name
+    if [[ -z "$app_name" && -f "package.json" ]]; then
+        app_name=$(grep -m 1 -o '"name": *"[^"]*"' package.json 2>/dev/null | cut -d '"' -f 4 | tr -d ' ' || echo "")
+        # Remove @scope/ if present
+        if [[ "$app_name" == *"/"* ]]; then
+            app_name=$(echo "$app_name" | cut -d '/' -f 2)
+        fi
+        # Remove @ if present at start
+        app_name=$(echo "$app_name" | sed 's/^@//')
+    fi
+    
+    # Final fallback to directory name
+    if [[ -z "$app_name" ]]; then
+        app_name=$(basename "$(pwd)" | tr -d ' ')
+    fi
+    
+    echo "$app_name"
+}
+
+# Function to setup mutagen sync and generate run_react_native.sh
+cmd_add() {
+    echo -e "${GREEN}Setting up React Native project for macOS VM...${NC}"
+    echo ""
+    
+    # Check if we're in a React Native project
+    if [[ ! -f "package.json" ]]; then
+        echo -e "${RED}Error: package.json not found. Please run this command in a React Native project directory.${NC}" >&2
+        exit 1
+    fi
+    
+    # Get app name
+    APP_NAME=$(get_app_name)
+    echo -e "${GREEN}Detected project name: $APP_NAME${NC}"
+    
+    # Get current directory
+    FULL_PATH=$(pwd)
+    DIR_NAME=$(basename "$FULL_PATH")
+    
+    # Get local IP address
+    echo -e "${GREEN}Detecting local IP address...${NC}"
+    IP_ADDR=$(hostname -I | awk '{print $1}' || echo "10.0.2.2")
+    if [[ -z "$IP_ADDR" ]]; then
+        IP_ADDR="10.0.2.2"
+        echo -e "${YELLOW}Warning: Could not detect IP, using default 10.0.2.2${NC}"
+    else
+        echo -e "${GREEN}Detected IP: $IP_ADDR${NC}"
+    fi
+    echo ""
+    
+    # Setup mutagen sync
+    echo -e "${GREEN}Setting up mutagen sync...${NC}"
+    
+    # Check if mutagen is installed
+    if ! command -v mutagen &> /dev/null; then
+        echo -e "${RED}Error: mutagen is not installed.${NC}" >&2
+        echo "Please install it first:" >&2
+        echo "  python3 install_mutagen.py" >&2
+        exit 1
+    fi
+    
+    # Check if sync already exists
+    if mutagen sync list "$APP_NAME" &>/dev/null; then
+        echo -e "${YELLOW}Sync '$APP_NAME' already exists.${NC}"
+        read -p "Do you want to terminate and recreate it? (y/n): " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            echo -e "${GREEN}Terminating existing sync...${NC}"
+            mutagen sync terminate "$APP_NAME" 2>/dev/null || true
+        else
+            echo -e "${YELLOW}Skipping sync setup.${NC}"
+        fi
+    fi
+    
+    # Create sync if it doesn't exist or was terminated
+    if ! mutagen sync list "$APP_NAME" &>/dev/null; then
+        echo -e "${GREEN}Creating mutagen sync session...${NC}"
+        # Use the same format as setup_sync.sh
+        mutagen sync create \
+            --name="$APP_NAME" \
+            "$FULL_PATH" \
+            "${MACOS_USER}@localhost:${MACOS_PORT}:~/src/$DIR_NAME" \
+            --ignore="node_modules" \
+            --ignore=".expo" \
+            --ignore=".git" \
+            --ignore="ios/build" \
+            --ignore="android/build" \
+            --ignore="android/app/build" \
+            --symlink-mode=posix-raw
+        
+        if [[ $? -eq 0 ]]; then
+            echo -e "${GREEN}✓ Mutagen sync created successfully!${NC}"
+        else
+            echo -e "${RED}Error: Failed to create mutagen sync${NC}" >&2
+            exit 1
+        fi
+    fi
+    echo ""
+    
+    # Install npm dependencies in the VM
+    # Wait a moment for initial file sync to complete
+    echo -e "${GREEN}Waiting for initial file sync...${NC}"
+    sleep 3
+    echo ""
+    echo -e "${GREEN}Installing npm dependencies in macOS VM...${NC}"
+    echo -e "${YELLOW}This may take a few minutes...${NC}"
+    
+    # Use login shell to ensure PATH is set correctly (for nvm, homebrew, etc.)
+    # Check if npm exists first, then run install
+    if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -p "$MACOS_PORT" "${MACOS_USER}@localhost" \
+        "bash -l -c 'cd ~/src/$DIR_NAME && if command -v npm >/dev/null 2>&1; then npm install; else echo \"npm not found. Please install Node.js/npm first.\" >&2; exit 1; fi'" 2>&1; then
+        echo -e "${GREEN}✓ npm dependencies installed in VM${NC}"
+    else
+        echo -e "${YELLOW}Warning: npm install in VM failed${NC}"
+        echo -e "${YELLOW}Possible reasons:${NC}"
+        echo -e "${YELLOW}  - npm/Node.js is not installed in the VM${NC}"
+        echo -e "${YELLOW}  - VM is not accessible${NC}"
+        echo -e "${YELLOW}You can install Node.js in the VM using Homebrew:${NC}"
+        echo -e "${YELLOW}  ssh -p $MACOS_PORT ${MACOS_USER}@localhost${NC}"
+        echo -e "${YELLOW}  brew install node${NC}"
+        echo -e "${YELLOW}Then run npm install manually:${NC}"
+        echo -e "${YELLOW}  cd ~/src/$DIR_NAME && npm install${NC}"
+    fi
+    echo ""
+    
+    # Generate run_react_native.sh
+    echo -e "${GREEN}Generating run_react_native.sh...${NC}"
+    cat > "$SYNC_SCRIPT" <<'EOF'
+#!/bin/bash
+# Run React Native (Expo) with correct hostname for Linux host.
+# Generated by 'xcode add' command
+# Accepts arguments that will be passed to expo start
+# --lan is automatically included unless --tunnel is provided
+# REACT_NATIVE_PACKAGER_HOSTNAME is not set when --tunnel is provided
+
+# Check if --tunnel is in the arguments
+HAS_TUNNEL=false
+for arg in "$@"; do
+    if [[ "$arg" == "--tunnel" ]]; then
+        HAS_TUNNEL=true
+        break
+    fi
+done
+
+# Build the command array
+CMD_ARGS=("npx" "expo" "start" "-c")
+
+# Only add --lan if --tunnel is not present
+if [[ "$HAS_TUNNEL" == "false" ]]; then
+    CMD_ARGS+=("--lan")
+fi
+
+# Add any additional arguments passed to the script
+CMD_ARGS+=("$@")
+
+# Execute the command
+# Only set REACT_NATIVE_PACKAGER_HOSTNAME if --tunnel is not present
+# Don't use exec to allow proper terminal interaction
+if [[ "$HAS_TUNNEL" == "false" ]]; then
+    REACT_NATIVE_PACKAGER_HOSTNAME=LINUX_HOST_IP_PLACEHOLDER "${CMD_ARGS[@]}"
+else
+    "${CMD_ARGS[@]}"
+fi
+EOF
+    # Replace the IP placeholder in the generated script
+    sed -i "s|LINUX_HOST_IP_PLACEHOLDER|${IP_ADDR}|g" "$SYNC_SCRIPT"
+    
+    chmod +x "$SYNC_SCRIPT"
+    echo -e "${GREEN}✓ Created $SYNC_SCRIPT${NC}"
+    echo ""
+    
+    echo "=================================================="
+    echo -e "${GREEN}Setup complete!${NC}"
+    echo "=================================================="
+    echo ""
+    echo "Mutagen sync: $APP_NAME"
+    echo "Local IP: $IP_ADDR"
+    echo "Now do: 'xcode run' to start the React Native app"
+    echo ""
+    echo "Monitor sync:"
+    echo "  mutagen sync list $APP_NAME"
+    echo "  mutagen sync monitor $APP_NAME"
+}
+
+# Function to run run_react_native.sh on macOS VM via SSH
+cmd_run() {
+    echo -e "${GREEN}Running React Native on macOS VM...${NC}"
+    echo ""
+    
+    # Get current directory info
+    FULL_PATH=$(pwd)
+    DIR_NAME=$(basename "$FULL_PATH")
+    
+    # Collect all arguments to pass to the script (after 'run')
+    shift  # Remove 'run' from arguments
+    EXTRA_ARGS=("$@")
+    
+    echo -e "${GREEN}Project directory: $DIR_NAME${NC}"
+    if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
+        echo -e "${GREEN}Additional arguments: ${EXTRA_ARGS[*]}${NC}"
+    fi
+    echo -e "${GREEN}Connecting to macOS VM (${MACOS_USER}@localhost:${MACOS_PORT})...${NC}"
+    echo ""
+    
+    # Build the remote command with proper argument escaping
+    # We'll execute it directly without heredoc to preserve terminal interaction
+    if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
+        # Build command string with proper escaping for each argument
+        ESCAPED_ARGS_STR=""
+        for arg in "${EXTRA_ARGS[@]}"; do
+            ESCAPED_ARGS_STR="$ESCAPED_ARGS_STR $(printf '%q' "$arg")"
+        done
+        REMOTE_CMD="cd ~/src/$DIR_NAME && ./run_react_native.sh$ESCAPED_ARGS_STR"
+    else
+        REMOTE_CMD="cd ~/src/$DIR_NAME && ./run_react_native.sh"
+    fi
+    
+    # SSH into macOS VM and run the command
+    # Use -tt to force pseudo-terminal allocation for interactive commands
+    # Pass command directly without heredoc to preserve stdin/stdout/stderr
+    # Ensure we're using a proper interactive shell and preserve terminal
+    ssh -tt \
+        -o StrictHostKeyChecking=no \
+        -o ConnectTimeout=10 \
+        -o RequestTTY=force \
+        -o LogLevel=ERROR \
+        -p "$MACOS_PORT" \
+        "${MACOS_USER}@localhost" \
+        "bash -l -c 'if [ ! -f ~/src/$DIR_NAME/run_react_native.sh ]; then echo \"Error: run_react_native.sh not found at ~/src/$DIR_NAME/\" >&2; echo \"Make sure you have run xcode add first\" >&2; exit 1; fi; $REMOTE_CMD'"
+    
+    echo ""
+    echo -e "${GREEN}Disconnected from macOS VM${NC}"
+}
+
+# Function to remove mutagen sync and run_react_native.sh
+cmd_remove() {
+    echo -e "${YELLOW}Removing React Native project setup...${NC}"
+    echo ""
+    
+    # Get app name
+    APP_NAME=$(get_app_name)
+    echo -e "${GREEN}Project name: $APP_NAME${NC}"
+    echo ""
+    
+    # Remove mutagen sync
+    if mutagen sync list "$APP_NAME" &>/dev/null; then
+        echo -e "${GREEN}Removing mutagen sync '$APP_NAME'...${NC}"
+        if mutagen sync terminate "$APP_NAME"; then
+            echo -e "${GREEN}✓ Mutagen sync terminated${NC}"
+        else
+            echo -e "${YELLOW}Warning: Failed to terminate sync (may already be stopped)${NC}"
+        fi
+    else
+        echo -e "${YELLOW}No mutagen sync found for '$APP_NAME'${NC}"
+    fi
+    echo ""
+    
+    # Remove run_react_native.sh
+    if [[ -f "$SYNC_SCRIPT" ]]; then
+        echo -e "${GREEN}Removing $SYNC_SCRIPT...${NC}"
+        rm -f "$SYNC_SCRIPT"
+        echo -e "${GREEN}✓ Removed $SYNC_SCRIPT${NC}"
+    else
+        echo -e "${YELLOW}$SYNC_SCRIPT not found${NC}"
+    fi
+    echo ""
+    
+    echo -e "${GREEN}Cleanup complete!${NC}"
+}
+
+# Main command handling
+case "${1:-}" in
+    add)
+        cmd_add
+        ;;
+    remove)
+        cmd_remove
+        ;;
+    run)
+        cmd_run "$@"
+        ;;
+    *)
+        echo "Usage: xcode {add|remove|run [args...]}" >&2
+        echo "" >&2
+        echo "Commands:" >&2
+        echo "  add              - Setup mutagen sync and generate run_react_native.sh" >&2
+        echo "  remove           - Remove mutagen sync and delete run_react_native.sh" >&2
+        echo "  run [args...]    - SSH to macOS VM and run run_react_native.sh" >&2
+        echo "                     Additional args are passed to the script (e.g., --tunnel)" >&2
+        echo "" >&2
+        echo "Examples:" >&2
+        echo "  xcode run                # Run with default args" >&2
+        echo "  xcode run --tunnel       # Run with --tunnel flag" >&2
+        echo "  xcode run --tunnel --ios # Run with multiple flags" >&2
+        exit 1
+        ;;
+esac
+
