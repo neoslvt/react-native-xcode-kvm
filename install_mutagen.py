@@ -16,7 +16,7 @@ def run_command(cmd, check=True, shell=False):
     """Run a shell command and return the result."""
     try:
         result = subprocess.run(
-            cmd if shell else cmd.split(),
+            cmd if (shell or not isinstance(cmd, str)) else cmd.split(),
             check=check,
             capture_output=True,
             text=True,
