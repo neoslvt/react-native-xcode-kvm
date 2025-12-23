@@ -16,7 +16,7 @@ Complete automation scripts for React Native development on Linux using macOS in
 ### 1. Installation
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/neoslvt/react-native-xcode-kvm
 cd react-native-xcode-kvm
 ./install.sh
 ```
